@@ -23,11 +23,11 @@ Notes:
 from pathlib import Path
 import io
 import re
+import base64
 import time
 import shutil
 import hashlib
 import tempfile
-from urllib.parse import urlparse
 
 import streamlit as st
 from PIL import Image
@@ -356,28 +356,104 @@ def wait_for_generated_image(page, previous_image_signatures, timeout_seconds=24
     )
 
 
+# JavaScript run INSIDE the ChatGPT tab: fetch the image with the page's own
+# login cookies (works for https:, blob: and data: sources) and return it
+# as a data URL.
+FETCH_IMAGE_JS = """
+async (img) => {
+    const src = img.currentSrc || img.src;
+    if (!src) return null;
+    const response = await fetch(src, { credentials: "include" });
+    if (!response.ok) return null;
+    const blob = await response.blob();
+    return await new Promise((resolve) => {
+        const reader = new FileReader();
+        reader.onload = () => resolve(reader.result);
+        reader.onerror = () => resolve(null);
+        reader.readAsDataURL(blob);
+    });
+}
+"""
+
+MIN_FULL_SIZE_PX = 700  # anything smaller is a preview, not the real image
+
+
+def write_as_png(data, output_path):
+    """Save image bytes as PNG and return (width, height)."""
+    img = Image.open(io.BytesIO(data))
+    img.load()
+
+    if img.mode not in ("RGB", "RGBA", "L"):
+        img = img.convert("RGBA")
+
+    img.save(output_path, "PNG")
+    return img.size
+
+
+def is_full_size(data):
+    try:
+        w, h = Image.open(io.BytesIO(data)).size
+        return max(w, h) >= MIN_FULL_SIZE_PX
+    except Exception:
+        return False
+
+
 def save_image_element(page, img, output_path):
-    """Save the selected generated image at full resolution when possible."""
-    src = img.get_attribute("src")
+    """
+    Save the generated image at full resolution.
 
-    if src and not src.startswith("data:"):
-        try:
-            parsed = urlparse(src)
+    Tries, in order:
+      1. Fetch the image's real file from inside the ChatGPT tab.
+      2. Click ChatGPT's own Download button.
+      3. Screenshot (last resort, low quality).
+    Returns a description like "original image, 1536×1024".
+    """
+    # 1) Fetch the original file from inside the page.
+    try:
+        data_url = img.evaluate(FETCH_IMAGE_JS)
 
-            if parsed.scheme in ("http", "https"):
-                response = page.request.get(src)
+        if data_url and "," in data_url:
+            data = base64.b64decode(data_url.split(",", 1)[1])
 
-                if response.ok:
-                    data = response.body()
+            if is_full_size(data):
+                w, h = write_as_png(data, output_path)
+                return f"original image, {w}×{h}"
+    except Exception:
+        pass
 
-                    if len(data) > 10_000:
-                        output_path.write_bytes(data)
-                        return "original image"
-        except Exception:
-            pass
+    # 2) Use ChatGPT's Download button (shown when hovering the image).
+    try:
+        img.scroll_into_view_if_needed()
+        img.hover()
+        time.sleep(0.8)
+
+        buttons = page.get_by_role("button", name=re.compile(r"download", re.I))
+
+        if buttons.count():
+            with page.expect_download(timeout=20_000) as download_info:
+                buttons.last.click()
+
+            temp_path = output_path.with_suffix(".download")
+            download_info.value.save_as(str(temp_path))
+            data = temp_path.read_bytes()
+            temp_path.unlink(missing_ok=True)
+
+            if is_full_size(data):
+                w, h = write_as_png(data, output_path)
+                return f"ChatGPT download, {w}×{h}"
+    except Exception:
+        pass
+
+    # 3) Last resort: screenshot the image after scrolling it fully into view.
+    try:
+        page.mouse.move(0, 0)  # remove hover overlays
+        img.scroll_into_view_if_needed()
+        time.sleep(0.5)
+    except Exception:
+        pass
 
     img.screenshot(path=str(output_path))
-    return "screen capture"
+    return "⚠️ screen capture (low quality, download manually)"
 
 
 def wait_until_chatgpt_ready(page, timeout_seconds=30):
