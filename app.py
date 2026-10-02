@@ -1,29 +1,36 @@
 """
-Streamlit ChatGPT Slide Translator — Chrome (attach mode)
+Streamlit ChatGPT Slide Translator — Chrome (attach mode) + PDF support
 
 Install:
     python -m pip install -r requirements.txt
+    (streamlit, playwright, pymupdf, pillow)
 
 Run:
     1. Double-click start_chrome.bat and log in to ChatGPT by hand.
     2. python -m streamlit run app.py
 
+Workflow:
+    Part A: prepare slides. Upload a PDF (pages are turned into images)
+            or upload pictures, then tick the slides you want.
+    Part B: send the selected slides to ChatGPT one by one.
+
 Notes:
 - Uses the ChatGPT WEB UI, not the OpenAI API.
 - The app does NOT launch the browser. It attaches to a Chrome window you
   opened yourself with --remote-debugging-port=9222.
-- Chrome needs its own profile folder (--user-data-dir) for this to work;
-  your login is saved there, so you only log in once.
 """
 
 from pathlib import Path
+import io
 import re
 import time
 import shutil
+import hashlib
 import tempfile
 from urllib.parse import urlparse
 
 import streamlit as st
+from PIL import Image
 from playwright.sync_api import sync_playwright
 
 
@@ -39,8 +46,8 @@ st.set_page_config(
 
 st.title("📚 ChatGPT Slide Translator")
 st.caption(
-    "Sends your slides to ChatGPT one by one using a Chrome window "
-    "you opened and logged into yourself."
+    "Prepare slides from a PDF or pictures, choose the ones you want, "
+    "and send them to ChatGPT one by one."
 )
 
 
@@ -50,6 +57,96 @@ st.caption(
 
 if "running" not in st.session_state:
     st.session_state.running = False
+
+
+# -------------------------------------------------------------------
+# Slide preparation helpers
+# -------------------------------------------------------------------
+
+@st.cache_data(show_spinner=False, max_entries=5)
+def render_pdf(pdf_bytes, dpi, stem):
+    """Render every PDF page to a PNG image."""
+    import fitz  # PyMuPDF
+
+    doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+
+    if doc.needs_pass:
+        doc.close()
+        raise ValueError("This PDF is password-protected.")
+
+    zoom = dpi / 72
+    digits = max(3, len(str(doc.page_count)))
+    pages = []
+
+    for i, page in enumerate(doc):
+        pix = page.get_pixmap(matrix=fitz.Matrix(zoom, zoom), alpha=False)
+        pages.append(
+            {
+                "name": f"{stem}_page_{i + 1:0{digits}d}.png",
+                "data": pix.tobytes("png"),
+            }
+        )
+
+    doc.close()
+    return pages
+
+
+@st.cache_data(show_spinner=False, max_entries=3000)
+def make_thumbnail(data, max_px=420):
+    """Small JPEG preview so the selection grid stays fast."""
+    img = Image.open(io.BytesIO(data))
+    img.thumbnail((max_px, max_px))
+
+    if img.mode not in ("RGB", "L"):
+        img = img.convert("RGB")
+
+    buf = io.BytesIO()
+    img.save(buf, "JPEG", quality=80)
+    return buf.getvalue()
+
+
+def parse_ranges(text, count):
+    """Turn '1-5, 8, 10-12' into a set of slide numbers (1-based)."""
+    result = set()
+
+    for part in re.split(r"[,\s]+", text.strip()):
+        if not part:
+            continue
+
+        if "-" in part:
+            a, b = part.split("-", 1)
+            a, b = int(a), int(b)
+            if a > b:
+                a, b = b, a
+            result.update(range(a, b + 1))
+        else:
+            result.add(int(part))
+
+    return {n for n in result if 1 <= n <= count}
+
+
+def pick_key(source_id, index):
+    return f"pick_{source_id}_{index}"
+
+
+def set_all(source_id, count, value):
+    for i in range(count):
+        st.session_state[pick_key(source_id, i)] = value
+
+
+def apply_range(source_id, count):
+    text = st.session_state.get(f"range_{source_id}", "")
+
+    try:
+        wanted = parse_ranges(text, count)
+    except ValueError:
+        st.session_state[f"range_error_{source_id}"] = True
+        return
+
+    st.session_state[f"range_error_{source_id}"] = False
+
+    for i in range(count):
+        st.session_state[pick_key(source_id, i)] = (i + 1) in wanted
 
 
 # -------------------------------------------------------------------
@@ -172,7 +269,6 @@ def image_signature(img):
         src = ""
 
     if src.startswith("data:"):
-        # Data URLs can be huge; the length is enough for tracking.
         return ("data", len(src))
 
     return ("src", src)
@@ -210,11 +306,7 @@ def get_image_signatures(page):
     return {image_signature(img) for img in find_large_images(page)}
 
 
-def wait_for_generated_image(
-    page,
-    previous_image_signatures,
-    timeout_seconds=240,
-):
+def wait_for_generated_image(page, previous_image_signatures, timeout_seconds=240):
     """Wait until a new large image appears and generation has finished."""
     deadline = time.time() + timeout_seconds
 
@@ -224,7 +316,6 @@ def wait_for_generated_image(
 
     while time.time() < deadline:
         generating = is_generating(page)
-
         current_images = find_large_images(page)
 
         new_images = [
@@ -240,8 +331,6 @@ def wait_for_generated_image(
         if new_images:
             saw_new_image = True
 
-        # Complete only after a new image exists, generation has stopped,
-        # and the UI has had a short settling period.
         if saw_new_image and not generating:
             if stable_since is None:
                 stable_since = time.time()
@@ -287,7 +376,6 @@ def save_image_element(page, img, output_path):
         except Exception:
             pass
 
-    # Fallback: screenshot the rendered image.
     img.screenshot(path=str(output_path))
     return "screen capture"
 
@@ -319,11 +407,10 @@ with st.sidebar:
         """
         **Workflow**
 
-        1. Double-click **start_chrome.bat**.
-        2. Log into ChatGPT in that Chrome window.
-        3. Upload your slide images here.
-        4. Enter your translation prompt.
-        5. Click **Start**. Keep the ChatGPT tab visible and don't type in it.
+        1. Double-click **start_chrome.bat** and log into ChatGPT.
+        2. **Part A:** upload a PDF or pictures and tick the slides you want.
+        3. **Part B:** check the prompt and click **Start**.
+        4. Keep the ChatGPT tab visible and don't type in it.
         """
     )
 
@@ -357,30 +444,165 @@ with st.sidebar:
     st.caption(f"Chrome debug address: {CDP_URL}")
 
 
-# -------------------------------------------------------------------
-# Main UI
-# -------------------------------------------------------------------
+# ===================================================================
+# PART A — Prepare slides
+# ===================================================================
 
-st.subheader("1. Slides")
+st.header("A. Prepare slides")
 
-uploaded_files = st.file_uploader(
-    "Upload your slide images",
-    type=IMAGE_TYPES,
-    accept_multiple_files=True,
-    help="Upload all slides. They will be processed in filename order.",
+source_type = st.radio(
+    "What will you upload?",
+    ["📄 PDF file", "🖼️ Pictures"],
+    horizontal=True,
+    disabled=st.session_state.running,
 )
 
-if uploaded_files:
-    uploaded_files = sorted(uploaded_files, key=lambda f: f.name.lower())
+slides = []        # list of {"name": str, "data": bytes}
+source_id = None   # changes whenever the input changes, resets selection
 
-    st.success(f"{len(uploaded_files)} slide(s) ready.")
+if source_type == "📄 PDF file":
+    col_up, col_dpi = st.columns([3, 1])
 
-    with st.expander("Show slide list"):
-        for i, file in enumerate(uploaded_files, 1):
-            st.write(f"{i}. {file.name}")
+    with col_up:
+        pdf_file = st.file_uploader(
+            "Upload a PDF",
+            type=["pdf"],
+            disabled=st.session_state.running,
+        )
+
+    with col_dpi:
+        dpi = st.selectbox(
+            "Image quality (DPI)",
+            [150, 200, 300],
+            index=1,
+            help="Higher DPI gives sharper slides but bigger files. "
+                 "200 is a good default.",
+        )
+
+    if pdf_file is not None:
+        pdf_bytes = pdf_file.getvalue()
+        stem = Path(pdf_file.name).stem
+
+        try:
+            with st.spinner("Extracting pages from the PDF..."):
+                slides = render_pdf(pdf_bytes, dpi, stem)
+        except Exception as e:
+            st.error(f"Could not read the PDF: {e}")
+            slides = []
+
+        source_id = hashlib.md5(
+            f"pdf|{pdf_file.name}|{len(pdf_bytes)}".encode()
+        ).hexdigest()[:10]
+
+else:
+    image_files = st.file_uploader(
+        "Upload slide pictures",
+        type=IMAGE_TYPES,
+        accept_multiple_files=True,
+        help="They will be sorted by file name.",
+        disabled=st.session_state.running,
+    )
+
+    if image_files:
+        image_files = sorted(image_files, key=lambda f: f.name.lower())
+        slides = [{"name": f.name, "data": f.getvalue()} for f in image_files]
+
+        source_id = hashlib.md5(
+            "imgs|".join(f"{f.name}:{f.size}" for f in image_files).encode()
+        ).hexdigest()[:10]
 
 
-st.subheader("2. Translation prompt")
+selected_slides = []
+
+if slides:
+    count = len(slides)
+
+    # Default: every slide selected.
+    for i in range(count):
+        st.session_state.setdefault(pick_key(source_id, i), True)
+
+    st.subheader("Choose slides to translate")
+
+    c1, c2, c3, c4, c5 = st.columns([1, 1, 2, 1, 1])
+
+    with c1:
+        st.button(
+            "✅ Select all",
+            on_click=set_all,
+            args=(source_id, count, True),
+            use_container_width=True,
+        )
+
+    with c2:
+        st.button(
+            "⬜ Clear all",
+            on_click=set_all,
+            args=(source_id, count, False),
+            use_container_width=True,
+        )
+
+    with c3:
+        st.text_input(
+            "Pages",
+            key=f"range_{source_id}",
+            placeholder="e.g. 1-5, 8, 10-12",
+            label_visibility="collapsed",
+        )
+
+    with c4:
+        st.button(
+            "Apply pages",
+            on_click=apply_range,
+            args=(source_id, count),
+            use_container_width=True,
+        )
+
+    with c5:
+        per_row = st.selectbox(
+            "Per row",
+            [3, 4, 5, 6],
+            index=1,
+            label_visibility="collapsed",
+        )
+
+    if st.session_state.get(f"range_error_{source_id}"):
+        st.warning("Could not read the page list. Use a format like 1-5, 8, 10-12.")
+
+    # Thumbnail grid with a checkbox under each slide.
+    for row_start in range(0, count, per_row):
+        cols = st.columns(per_row)
+
+        for offset, slide in enumerate(slides[row_start:row_start + per_row]):
+            i = row_start + offset
+
+            with cols[offset]:
+                st.image(make_thumbnail(slide["data"]), width="stretch")
+                st.checkbox(
+                    f"{i + 1}. {slide['name']}",
+                    key=pick_key(source_id, i),
+                    disabled=st.session_state.running,
+                )
+
+    selected_slides = [
+        slide
+        for i, slide in enumerate(slides)
+        if st.session_state.get(pick_key(source_id, i))
+    ]
+
+    st.info(f"**{len(selected_slides)}** of {count} slide(s) selected.")
+
+else:
+    st.caption("Upload a PDF or pictures to see your slides here.")
+
+
+st.divider()
+
+
+# ===================================================================
+# PART B — Send to ChatGPT
+# ===================================================================
+
+st.header("B. Translate with ChatGPT")
 
 default_prompt = """Translate this slide into the target language.
 
@@ -399,20 +621,13 @@ prompt = st.text_area(
     help="Paste your own prompt here if you already have one that gives you good results.",
 )
 
-
-st.subheader("3. Run")
-
 start = st.button(
-    "🚀 Start translating all slides",
+    f"🚀 Translate {len(selected_slides)} selected slide(s)",
     type="primary",
-    disabled=not uploaded_files or st.session_state.running,
+    disabled=not selected_slides or st.session_state.running,
     use_container_width=True,
 )
 
-
-# -------------------------------------------------------------------
-# Translation
-# -------------------------------------------------------------------
 
 if start:
     st.session_state.running = True
@@ -427,9 +642,9 @@ if start:
 
         local_files = []
 
-        for uploaded in uploaded_files:
-            path = input_dir / uploaded.name
-            path.write_bytes(uploaded.getbuffer())
+        for slide in selected_slides:
+            path = input_dir / slide["name"]
+            path.write_bytes(slide["data"])
             local_files.append(path)
 
         completed = 0
@@ -463,22 +678,16 @@ if start:
                 )
 
                 try:
-                    status.info(
-                        f"Preparing slide {index + 1}/{len(local_files)}..."
-                    )
+                    status.info(f"Preparing slide {index + 1}/{len(local_files)}...")
 
-                    # Images already on the page BEFORE upload; the
-                    # generated image must be a new one.
                     before_upload = get_image_signatures(page)
 
                     attach_image(page, image_path)
                     time.sleep(1.5)
 
                     status.info(
-                        f"Sending prompt for slide "
-                        f"{index + 1}/{len(local_files)}..."
+                        f"Sending prompt for slide {index + 1}/{len(local_files)}..."
                     )
-
                     send_prompt(page, prompt)
 
                     status.info(
@@ -493,16 +702,13 @@ if start:
                     )
 
                     status.info(
-                        f"Saving translated slide "
-                        f"{index + 1}/{len(local_files)}..."
+                        f"Saving translated slide {index + 1}/{len(local_files)}..."
                     )
 
                     method = save_image_element(page, generated_img, output_path)
 
                     completed += 1
-                    st.success(
-                        f"✓ {image_path.name} → {output_path.name} ({method})"
-                    )
+                    st.success(f"✓ {image_path.name} → {output_path.name} ({method})")
 
                 except Exception as exc:
                     failed += 1
@@ -515,12 +721,10 @@ if start:
                 progress.progress((index + 1) / len(local_files))
 
             status.empty()
+            current_slide.empty()
 
-        # Zip the results.
         zip_base = base_dir / "translated_slides"
-        zip_path = Path(
-            shutil.make_archive(str(zip_base), "zip", root_dir=output_dir)
-        )
+        zip_path = Path(shutil.make_archive(str(zip_base), "zip", root_dir=output_dir))
 
         st.divider()
         st.success(f"Finished. {completed} translated, {failed} failed.")

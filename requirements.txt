@@ -1,2 +1,4 @@
 streamlit
 playwright
+pymupdf
+pillow
